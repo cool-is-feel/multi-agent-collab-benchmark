@@ -1,0 +1,21 @@
+# 环境变量（含 API Key，切勿提交）
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+myenv/
+
+# 运行产物
+logs/
+*.log
+data/*.log
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+~$*.pptx
+~$*.xlsx
