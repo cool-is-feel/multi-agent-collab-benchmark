@@ -17,7 +17,10 @@ from control_layer import (  # noqa: E402
     ResourceBudget,
     RuntimeGovernor,
     TaskRequest,
+    VerificationCheck,
+    VerificationReport,
 )
+from run_benchmark import benchmark_governance, score_math  # noqa: E402
 
 
 class TopologySelectionTests(unittest.TestCase):
@@ -66,6 +69,65 @@ class TopologySelectionTests(unittest.TestCase):
         profile = self.layer.profile_task(request)
         decision = self.layer.select_topology(profile, request.budget)
         self.assertEqual("centralized", decision.topology)
+
+    def test_creative_and_debate_tasks_use_decentralized_topology(self):
+        for request in (
+            TaskRequest(task="为年轻受众提出三个不同风格的创意口号", task_type="creative"),
+            TaskRequest(task="就远程办公给出正反观点并权衡结论", task_type="decision"),
+        ):
+            decision = self.layer.select_topology(
+                self.layer.profile_task(request), request.budget
+            )
+            self.assertEqual("decentralized", decision.topology)
+
+    def test_difficulty_only_changes_capacity_not_risk(self):
+        governance = benchmark_governance({
+            "task_id": "creative-hard", "category": "creative_writing",
+            "difficulty": "hard",
+        })
+        self.assertNotIn("risk_level", governance)
+        self.assertEqual(12, governance["budget"]["max_calls"])
+
+    def test_force_topology_supports_paired_experiments(self):
+        request = TaskRequest(task="提出多个创意方案", task_type="creative")
+        profile = self.layer.profile_task(request)
+        decision = self.layer.select_topology(
+            profile, request.budget, force_topology="centralized"
+        )
+        self.assertEqual("centralized", decision.topology)
+        self.assertIn("forced centralized", decision.reason)
+        coding = TaskRequest(task="实现一个排序函数", task_type="coding")
+        forced_peer = self.layer.select_topology(
+            self.layer.profile_task(coding), coding.budget,
+            force_topology="decentralized",
+        )
+        self.assertEqual("decentralized", forced_peer.topology)
+
+    def test_balanced_probe_routes_to_expected_topologies(self):
+        probes = json.loads(
+            (ROOT / "data" / "TopologyRoutingProbe.json").read_text(encoding="utf-8")
+        )
+        expected_counts = {"centralized": 0, "decentralized": 0}
+        for probe in probes:
+            expected_counts[probe["expected_topology"]] += 1
+            request = TaskRequest(
+                task=probe["task"], task_type=probe["task_type"],
+                risk_level=probe.get("risk_level"),
+            )
+            decision = self.layer.select_topology(
+                self.layer.profile_task(request), request.budget
+            )
+            self.assertEqual(
+                probe["expected_topology"], decision.topology, probe["task_id"]
+            )
+        self.assertEqual(
+            expected_counts["centralized"], expected_counts["decentralized"]
+        )
+
+    def test_math_scoring_prefers_labelled_final_result(self):
+        answer = "1. 个位计算：8 + 4 = 12\n2. 十位计算完成\n### 结果\n42"
+        self.assertTrue(score_math(answer, "答案：42"))
+        self.assertTrue(score_math("6/36 = 1/6", "答案：1/6"))
 
 
 class GovernanceTests(unittest.TestCase):
@@ -144,6 +206,39 @@ class EndToEndControlTests(unittest.TestCase):
         self.assertIn("verification.completed", event_types)
         self.assertIn("run.terminated", event_types)
         json.dumps(result, ensure_ascii=False)
+
+    def test_adaptive_falls_back_to_alternate_topology_after_failed_gate(self):
+        layer = CollaborationControlLayer()
+        primary = {"final_result": "incomplete primary", "history": []}
+        alternate = {"final_result": "complete alternate", "history": []}
+        failed = VerificationReport(False, "failed", [
+            VerificationCheck("independent_review", "independent_review",
+                              False, True, "missing requirements")
+        ], 1)
+        passed = VerificationReport(True, "passed", [
+            VerificationCheck("non_empty", "rule", True, True, "answer is present")
+        ], 1)
+        request = {
+            "task": "提出一个包含多个步骤和验收指标的方案",
+            "task_type": "analysis",
+            "budget": {
+                "max_calls": 10, "max_steps": 40,
+                "max_input_tokens": 12000, "max_output_tokens": 8000,
+                "max_total_tokens": 18000, "max_revisions": 1,
+            },
+        }
+
+        with patch.object(layer, "_run_topology", side_effect=[primary, alternate]) as run, \
+             patch.object(layer, "_verify", side_effect=[failed, passed]):
+            result = layer.execute(request)
+
+        self.assertEqual(2, run.call_count)
+        self.assertEqual("complete alternate", result["final_result"])
+        self.assertEqual("decentralized", result["topology_decision"]["topology"])
+        self.assertTrue(result["verification_report"]["passed"])
+        self.assertIn("topology.fallback", {
+            event["event_type"] for event in result["audit_trail"]
+        })
 
 
 if __name__ == "__main__":

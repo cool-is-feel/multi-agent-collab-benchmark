@@ -59,7 +59,7 @@ CATEGORY_MAP = {
     "code":             ("centralized",   "coding"),
     "creative_writing": ("decentralized", "creative"),
     "translation":      ("decentralized", "translation"),
-    "debate":           ("hierarchical",  "analysis"),
+    "debate":           ("decentralized", "decision"),
     "open_reasoning":   ("hierarchical",  "analysis"),
     "fact_checking":    ("hierarchical",  "analysis"),
     "planning":         ("hierarchical",  "analysis"),
@@ -87,15 +87,16 @@ def resolve_mode(q: dict, adaptive: bool = True):
 
 
 def benchmark_governance(q: dict) -> dict:
-    """Translate benchmark metadata into platform-style risk and resource boundaries."""
+    """Translate benchmark metadata into resource boundaries.
+
+    Difficulty controls capacity, not real-world consequence.  Risk is inferred from
+    task content unless a dataset provides an explicit ``risk_level``.
+    """
     difficulty = q.get("difficulty", "medium")
     calls = {"easy": 8, "medium": 10, "hard": 12}.get(difficulty, 10)
     total_tokens = {"easy": 9000, "medium": 14000, "hard": 18000}.get(difficulty, 14000)
     return {
         "task_id": q["task_id"],
-        "risk_level": {"easy": "low", "medium": "medium", "hard": "high"}.get(
-            difficulty, "medium"
-        ),
         "budget": {
             "max_calls": calls, "max_steps": calls * 4,
             "max_input_tokens": total_tokens, "max_output_tokens": total_tokens,
@@ -103,6 +104,7 @@ def benchmark_governance(q: dict) -> dict:
             "max_cost_usd": 0.15, "max_revisions": 1,
         },
         "metadata": {"category": q["category"], "difficulty": difficulty},
+        **({"risk_level": q["risk_level"]} if q.get("risk_level") else {}),
     }
 
 
@@ -112,16 +114,19 @@ def _extract_value(text) -> float | None:
     例：'6/36 = 1/6'→0.1667；'3/5（=0.6）'→0.6；'C(10,3)=120'→120；'1.158e+04'→11580。
     """
     s = str(text)
+    labelled = re.findall(r'(?:最终答案|最终结果|答案|结果)\s*[：:]?\s*([^\n]+)', s, re.I)
+    if labelled:
+        s = labelled[-1]
     if "=" in s:                       # 答案通常在等号后
         s = s.split("=")[-1]
-    m = re.search(r'\d+\.?\d*[eE][+-]?\d+', s)   # 科学计数法
-    if m:
-        return float(m.group(0))
-    m = re.search(r'(\d+)\s*/\s*(\d+)', s)        # 分数
-    if m and int(m.group(2)) != 0:
-        return int(m.group(1)) / int(m.group(2))
-    m = re.search(r'\d+\.?\d*', s)                # 普通数字
-    return float(m.group(0)) if m else None
+    scientific = re.findall(r'-?\d+\.?\d*[eE][+-]?\d+', s)
+    if scientific:
+        return float(scientific[-1])
+    fractions = re.findall(r'(-?\d+)\s*/\s*(-?\d+)', s)
+    if fractions and int(fractions[-1][1]) != 0:
+        return int(fractions[-1][0]) / int(fractions[-1][1])
+    numbers = re.findall(r'-?\d+\.?\d*', s)
+    return float(numbers[-1]) if numbers else None
 
 
 def _first_number(text) -> float | None:

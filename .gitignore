@@ -10,6 +10,8 @@ myenv/
 
 # 运行产物（可重新生成，不入库）
 data/benchmark_v2_results*.json
+data/topology_study_results*.json
+data/topology_study_summary*.json
 reports/
 logs/
 *.log

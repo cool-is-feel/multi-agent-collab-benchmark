@@ -121,6 +121,28 @@ Agent 消息统一序列化为协议 `1.0` 信封，包含 `message_id`、`sende
 
 结果按 `(task_id, mode)` 增量落盘，再次运行自动跳过已完成部分。
 
+## 路由验证
+
+`data/TopologyRoutingProbe.json` 是一个平衡的小型路由探针集：6 道任务预期适合
+中心化，6 道预期适合去中心化。离线测试只验证路由特征和规则没有退化：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+真正验证拓扑效果时，必须对同一道题配对运行四个实验分支：单 Agent、强制中心化、
+强制去中心化和 adaptive。以下命令支持中断续跑：
+
+```bash
+python src/run_topology_study.py --repeats 3
+```
+
+结果写入 `data/topology_study_results.json`，摘要写入
+`data/topology_study_summary.json`。摘要报告四路正确率、adaptive 相对 single 的配对
+净胜题数、McNemar 精确检验、路由选择准确率以及每个路由失配案例。小探针用于发现
+路由错误，不替代 200 题主 benchmark；只有实测摘要达到验收门槛，才能声称当前模型和
+版本上的 adaptive 优于单 Agent。
+
 ## 我们实测的结果
 
 在 `deepseek-v4-flash` 模型上跑完 200 题：

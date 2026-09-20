@@ -95,6 +95,7 @@ class TaskRequest:
     budget: ResourceBudget = field(default_factory=ResourceBudget)
     models: Optional[List[str]] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    force_topology: Optional[str] = None
 
     @classmethod
     def from_value(cls, value: Dict[str, Any] | "TaskRequest"):
@@ -117,6 +118,10 @@ class TaskProfile:
     risk_level: str
     risk_score: float
     verification_modes: List[str]
+    answer_objectivity: float = 0.5
+    diversity_benefit: float = 0.5
+    verification_strength: float = 0.5
+    coordination_need: float = 0.5
 
 
 @dataclass
@@ -137,6 +142,8 @@ class TopologyDecision:
     layers: int = 1
     selection_confidence: float = 0.0
     alternatives: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    decision_margin: float = 0.0
+    needs_exploration: bool = False
 
 
 @dataclass
@@ -369,6 +376,14 @@ class CollaborationControlLayer:
         "high": ("医疗", "法律", "合规", "财务", "生产", "安全", "隐私", "支付"),
         "medium": ("客户", "上线", "合同", "决策", "迁移", "部署", "数据"),
     }
+    DIVERSITY_WORDS = (
+        "创意", "创作", "头脑风暴", "多个观点", "不同观点", "正反", "辩论",
+        "权衡", "争议", "伦理", "受众", "风格", "本地化", "隐喻", "双关",
+    )
+    OBJECTIVE_WORDS = (
+        "计算", "求解", "证明", "代码", "函数", "算法", "调试", "唯一",
+        "准确", "事实", "来源", "步骤", "约束", "验收", "测试", "API",
+    )
 
     def __init__(self, adapter: Optional[PlatformAdapter] = None,
                  communication_policy: Optional[CommunicationPolicy] = None):
@@ -383,8 +398,12 @@ class CollaborationControlLayer:
         ))
         complexity = min(1.0, 0.15 + len(text) / 1200 + constraint_count * 0.08
                          + (0.15 if request.test_cases else 0))
-        ambiguity = min(1.0, 0.15 + (0.35 if task_type in ("creative", "decision", "analysis") else 0)
-                        + text.count("或") * 0.05)
+        type_ambiguity = {
+            "creative": 0.75, "decision": 0.72, "translation": 0.55,
+            "analysis": 0.48, "choice": 0.25, "estimation": 0.25,
+            "computation": 0.08, "coding": 0.15,
+        }.get(task_type, 0.4)
+        ambiguity = min(1.0, type_ambiguity + min(0.15, text.count("或") * 0.04))
         decomposition_words = ("分别", "多个", "方案", "步骤", "模块", "维度", "系统", "架构")
         decomposability = min(1.0, 0.15 + sum(w in text for w in decomposition_words) * 0.12
                               + complexity * 0.35)
@@ -399,6 +418,34 @@ class CollaborationControlLayer:
         if risk_level not in ("low", "medium", "high"):
             risk_level = "medium"
         risk_score = {"low": 0.25, "medium": 0.6, "high": 0.9}.get(risk_level, 0.6)
+
+        objectivity = {
+            "computation": 0.98, "coding": 0.92, "choice": 0.88,
+            "estimation": 0.78, "translation": 0.52, "analysis": 0.58,
+            "decision": 0.32, "creative": 0.12,
+        }.get(task_type, 0.5)
+        diversity = {
+            "creative": 0.95, "decision": 0.9, "translation": 0.72,
+            "analysis": 0.42, "estimation": 0.38, "choice": 0.2,
+            "coding": 0.15, "computation": 0.1,
+        }.get(task_type, 0.4)
+        diversity_hits = sum(word in text for word in self.DIVERSITY_WORDS)
+        objective_hits = sum(word in text for word in self.OBJECTIVE_WORDS)
+        diversity = min(1.0, diversity + min(0.24, diversity_hits * 0.06))
+        objectivity = min(1.0, objectivity + min(0.18, objective_hits * 0.03))
+        if diversity_hits and task_type not in ("computation", "coding"):
+            objectivity = max(0.05, objectivity - min(0.12, diversity_hits * 0.03))
+
+        verification_strength = min(
+            1.0,
+            0.18 + 0.50 * objectivity + 0.12 * bool(request.test_cases)
+            + 0.04 * min(3, constraint_count)
+            + 0.08 * any(word in text for word in ("来源", "证据", "测试", "验收")),
+        )
+        coordination_need = min(
+            1.0, 0.12 + 0.42 * complexity + 0.34 * decomposability
+            + 0.10 * (task_type in ("coding", "analysis"))
+        )
         modes = ["rule"]
         if request.test_cases:
             modes.append("test")
@@ -406,10 +453,15 @@ class CollaborationControlLayer:
             modes.append("independent_review")
         if "证据" in text or "来源" in text or "事实" in text:
             modes.append("evidence")
-        return TaskProfile(task_type, round(complexity, 3), round(ambiguity, 3),
-                           round(decomposability, 3), risk_level, risk_score, modes)
+        return TaskProfile(
+            task_type, round(complexity, 3), round(ambiguity, 3),
+            round(decomposability, 3), risk_level, risk_score, modes,
+            round(objectivity, 3), round(diversity, 3),
+            round(verification_strength, 3), round(coordination_need, 3),
+        )
 
-    def select_topology(self, profile: TaskProfile, budget: ResourceBudget) -> TopologyDecision:
+    def select_topology(self, profile: TaskProfile, budget: ResourceBudget,
+                        force_topology: Optional[str] = None) -> TopologyDecision:
         """Choose where authority lives, then size the centralized hierarchy if selected.
 
         The score is expected utility, not a claim of universal optimality.  Every
@@ -417,18 +469,26 @@ class CollaborationControlLayer:
         """
         tt = profile.task_type
         objective = tt in ("choice", "estimation", "computation", "coding")
-        exploratory = tt in ("creative", "translation", "decision")
         tight_budget = budget.max_calls <= 4 or budget.max_total_tokens <= 4000
 
-        central_fit = 0.78 if objective else 0.55
-        central_fit += 0.15 * profile.decomposability + 0.10 * profile.complexity
-        decentralized_fit = 0.78 if exploratory else 0.42
-        decentralized_fit += 0.22 * profile.ambiguity
+        central_fit = min(1.0, 0.20 + 0.46 * profile.answer_objectivity
+                          + 0.20 * profile.coordination_need
+                          + 0.12 * profile.decomposability
+                          - 0.10 * profile.diversity_benefit)
+        decentralized_fit = min(1.0, 0.20 + 0.48 * profile.diversity_benefit
+                                + 0.16 * profile.ambiguity
+                                + 0.08 * (1.0 - profile.coordination_need)
+                                - 0.10 * profile.answer_objectivity)
 
-        central_verification = 0.55 + 0.35 * profile.risk_score
-        if tt == "coding":
-            central_verification += 0.15
-        decentralized_verification = 0.45 - 0.15 * profile.risk_score
+        # Risk controls verification intensity. It is not evidence that one authority
+        # topology is universally safer, so it is not baked into either capability.
+        central_verification = min(1.0, 0.38 + 0.48 * profile.verification_strength
+                                   + 0.08 * profile.answer_objectivity)
+        decentralized_verification = min(
+            1.0, 0.38 + 0.30 * profile.verification_strength
+            + 0.20 * profile.diversity_benefit
+            + 0.06 * profile.ambiguity,
+        )
 
         # Estimated resource ratios are deliberately simple and observable.  They
         # will be replaced/calibrated by historical p(success), cost and latency.
@@ -438,11 +498,16 @@ class CollaborationControlLayer:
         decentralized_cost = decentralized_calls / max(1, budget.max_calls)
         central_latency = min(1.0, (2 + 2 * profile.complexity) / 6)
         decentralized_latency = min(1.0, (3 + 3 * profile.ambiguity) / 6)
-        central_risk = 0.08 * profile.risk_score
-        decentralized_risk = 0.38 * profile.risk_score
+        central_risk = profile.risk_score * (
+            0.10 + 0.08 * profile.diversity_benefit
+        )
+        decentralized_risk = profile.risk_score * (
+            0.10 + 0.08 * profile.answer_objectivity
+        )
 
         def components(fit, verification, cost, latency, risk):
-            utility = 0.50 * fit + 0.30 * verification - 0.10 * cost - 0.05 * latency - 0.25 * risk
+            utility = (0.55 * fit + 0.25 * verification - 0.10 * cost
+                       - 0.05 * latency - 0.05 * risk)
             return {
                 "task_fit": round(fit, 4),
                 "verification_capability": round(verification, 4),
@@ -461,13 +526,21 @@ class CollaborationControlLayer:
         }
         scores = {name: values["expected_utility"] for name, values in alternatives.items()}
         topology = max(scores, key=scores.get)
-        if budget.max_calls <= 3 or budget.max_total_tokens <= 3000:
-            topology = "centralized"
-        if tt == "coding":
-            topology = "centralized"
+        if force_topology not in (None, "centralized", "decentralized"):
+            raise ValueError("force_topology must be centralized or decentralized")
+        if not force_topology:
+            if budget.max_calls <= 3 or budget.max_total_tokens <= 3000:
+                topology = "centralized"
+            if tt == "coding":
+                topology = "centralized"
+        else:
+            # Explicit forcing exists only for paired evaluation and operator
+            # overrides; normal adaptive execution still applies safety defaults.
+            topology = force_topology
         ranked = sorted(scores.values(), reverse=True)
         margin = ranked[0] - ranked[1]
-        confidence = 1.0 / (1.0 + math.exp(-6 * margin))
+        confidence = min(0.99, 0.5 + 2.5 * margin)
+        needs_exploration = not force_topology and margin < 0.06
 
         available_workers = max(1, min(6, budget.max_calls - 2))
         if topology == "decentralized":
@@ -498,13 +571,16 @@ class CollaborationControlLayer:
                 RoleSpec("verifier", "run rules or tests", True),
                 RoleSpec("synthesizer", "produce the bounded final result"),
             ][:team_size]
-        reason = (f"selected {topology} with utility={scores[topology]:.4f}; "
+        selection_kind = "forced" if force_topology else "selected"
+        reason = (f"{selection_kind} {topology} with utility={scores[topology]:.4f}; "
                   f"runner_up_margin={margin:.4f}; task_type={tt}; complexity={profile.complexity}; "
                   f"ambiguity={profile.ambiguity}; decomposability={profile.decomposability}; "
+                  f"objectivity={profile.answer_objectivity}; diversity={profile.diversity_benefit}; "
                   f"risk={profile.risk_level}; layers={layers}; call_budget={budget.max_calls}")
         return TopologyDecision(topology, reason, team_size, roles,
                                 {k: round(v, 4) for k, v in scores.items()},
-                                orchestration_style, layers, round(confidence, 4), alternatives)
+                                orchestration_style, layers, round(confidence, 4), alternatives,
+                                round(margin, 4), needs_exploration)
 
     def _run_layered_centralized(self, request: TaskRequest,
                                  decision: TopologyDecision) -> Dict[str, Any]:
@@ -624,7 +700,15 @@ class CollaborationControlLayer:
                 "all pipeline tests passed" if test_passed else "no all-pass runner evidence",
             ))
 
-        review_required = profile.risk_level in ("medium", "high")
+        # Adaptive runs need a quality gate even for low-risk prompts.  Risk is
+        # about consequence; it is not a proxy for whether a candidate covers
+        # every requested requirement.  Forced topology runs retain the cheaper
+        # historical policy for paired benchmarking.
+        review_required = (
+            profile.risk_level in ("medium", "high")
+            or request.metadata.get("adaptive_quality_gate", False)
+            or request.force_topology is None
+        )
         if review_required and governor.can_continue():
             prompt = (
                 "你是独立验收员，不参与原协作。严格检查候选结果是否完成任务、满足约束、"
@@ -683,7 +767,7 @@ class CollaborationControlLayer:
         governor = RuntimeGovernor(request.budget, self.communication_policy,
                                    self.adapter, request.task_id)
         profile = self.profile_task(request)
-        decision = self.select_topology(profile, request.budget)
+        decision = self.select_topology(profile, request.budget, request.force_topology)
         governor.emit("topology.selected", "control-layer", {
             **asdict(decision), "profile": asdict(profile),
         })
@@ -695,6 +779,31 @@ class CollaborationControlLayer:
             result = self._run_topology(request, decision)
             answer = str(result.get("final_result", ""))
             report = self._verify(request, profile, answer, result, governor, 1)
+            # A topology decision is a hypothesis, not a guarantee.  For an
+            # adaptive request, test the other topology before spending the
+            # remaining revision budget.  This reserves room for a genuinely
+            # different solution instead of repeatedly polishing a failed one.
+            if (
+                not request.force_topology
+                and not report.passed
+                and governor.can_continue(calls_needed=3)
+            ):
+                alternate = "decentralized" if decision.topology == "centralized" else "centralized"
+                alternate_decision = self.select_topology(profile, request.budget, alternate)
+                governor.emit("topology.fallback", "control-layer", {
+                    "from": decision.topology, "to": alternate,
+                    "reason": "primary candidate failed quality gate",
+                })
+                alternate_result = self._run_topology(request, alternate_decision)
+                alternate_answer = str(alternate_result.get("final_result", ""))
+                alternate_report = self._verify(
+                    request, profile, alternate_answer, alternate_result, governor, 1
+                )
+                if alternate_report.passed or not answer.strip():
+                    decision = alternate_decision
+                    result, answer, report = (
+                        alternate_result, alternate_answer, alternate_report
+                    )
             if not report.passed and governor.can_continue(require_revision=True):
                 answer = self._revise(request, profile, answer, report, governor)
                 report = self._verify(request, profile, answer, result, governor, 2)

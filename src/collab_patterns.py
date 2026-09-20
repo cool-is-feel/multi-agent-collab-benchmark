@@ -95,11 +95,50 @@ except ImportError:  # pragma: no cover
 # 配置（集中管理，便于统一调参）
 # ═══════════════════════════════════════════════════════════════
 
-MAX_TOKENS = 400          # 单次生成长度上限，防止拖慢 benchmark
+MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "800"))
 REQUEST_TIMEOUT = 180      # 单次请求硬超时（秒）；推理型模型部分调用很慢，需放宽避免误杀
-MAX_RETRIES = 1            # LLM 调用重试次数（推理型模型的慢调用重试也慢，快速失败更划算）
-MAX_CONCURRENT_LLM = 4     # 全局并发上限，避免服务端排队/限流导致反向减速
+MAX_RETRIES = int(os.getenv("LLM_MAX_ATTEMPTS", "3"))
+MAX_CONCURRENT_LLM = int(os.getenv("LLM_MAX_CONCURRENCY", "4"))
 _LLM_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_LLM)
+
+
+class _RequestRateLimiter:
+    """Process-wide request-start limiter shared by all agent threads."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.next_start = 0.0
+
+    def acquire(self, requests_per_minute: float) -> None:
+        if requests_per_minute <= 0:
+            return
+        interval = 60.0 / requests_per_minute
+        with self.lock:
+            now = time.monotonic()
+            scheduled = max(now, self.next_start)
+            self.next_start = scheduled + interval
+        wait = scheduled - now
+        if wait > 0:
+            time.sleep(wait)
+
+
+_REQUEST_RATE_LIMITER = _RequestRateLimiter()
+
+
+def _requests_per_minute(model_name: str) -> float:
+    configured = os.getenv("LLM_RPM_LIMIT")
+    if configured is not None:
+        try:
+            return max(0.0, float(configured))
+        except ValueError:
+            logger.warning("忽略无效的 LLM_RPM_LIMIT=%r", configured)
+            return 0.0
+    return 9.0 if model_name.lower().startswith("step-") else 0.0
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "429" in text or "rate_limit" in text or "rate limited" in text
 
 # 各阶段温度（集中定义，便于统一调参）
 T_CHOICE = 0.6            # 客观选择题 agent
@@ -185,7 +224,10 @@ def reset_token_stats() -> None:
 def _track_usage(resp) -> None:
     """尽力而为地统计 token（部分 provider 不返回则忽略）。"""
     try:
-        usage = (resp.response_metadata or {}).get("token_usage", {}) or {}
+        metadata = getattr(resp, "response_metadata", None) or {}
+        usage = metadata.get("token_usage", {}) or getattr(resp, "usage", None) or {}
+        if hasattr(usage, "model_dump"):
+            usage = usage.model_dump()
         inp = usage.get("prompt_tokens", 0)
         out = usage.get("completion_tokens", 0)
         if inp or out:
@@ -200,7 +242,61 @@ def _track_usage(resp) -> None:
         pass
 
 
-def _invoke_hard_timeout(llm, prompt: str, timeout: float):
+def _message_text(message: Any, field: str) -> str:
+    """Read text from LangChain's normalized and provider-specific fields."""
+    choices = getattr(message, "choices", None)
+    if choices:
+        message = choices[0].message
+    value = getattr(message, field, None)
+    if not value:
+        value = (getattr(message, "additional_kwargs", None) or {}).get(field)
+    if not value:
+        value = (getattr(message, "response_metadata", None) or {}).get(field)
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return "\n".join(
+            str(item.get("text", "") if isinstance(item, dict) else item)
+            for item in value
+        ).strip()
+    return str(value).strip() if value else ""
+
+
+def _reasoning_text(message: Any) -> str:
+    return (_message_text(message, "reasoning_content")
+            or _message_text(message, "reasoning"))
+
+
+def _finalize_reasoning(llm, reasoning: str, model_name: str,
+                        effective_timeout: float,
+                        raw_request: Optional[Dict[str, Any]] = None) -> str:
+    """Turn a provider-only reasoning response into a short public answer."""
+    max_chars = int(os.getenv("LLM_FINALIZE_REASONING_CHARS", "12000"))
+    final_prompt = (
+        "下面是模型已经完成的推理草稿。不要重新分析，也不要解释你的过程。"
+        "请直接给出可提交给用户的最终答案；若题目要求特定格式，严格遵守。\n\n"
+        f"推理草稿：\n{reasoning[-max_chars:]}"
+    )
+    _REQUEST_RATE_LIMITER.acquire(_requests_per_minute(model_name))
+    with _LLM_SEMAPHORE:
+        response = _invoke_hard_timeout(
+            llm, final_prompt, effective_timeout, raw_request=raw_request
+        )
+    _track_usage(response)
+    content = _message_text(response, "content")
+    if content:
+        return content
+    # Some StepFun responses remain reasoning-only even for the finalizer.
+    # Keep the latest provider text as a usable fallback instead of turning a
+    # formatting quirk into a failed benchmark arm.
+    finalized_reasoning = _reasoning_text(response)
+    if finalized_reasoning:
+        return finalized_reasoning
+    return reasoning
+
+
+def _invoke_hard_timeout(llm, prompt: str, timeout: float,
+                         raw_request: Optional[Dict[str, Any]] = None):
     """在守护线程里调用 llm.invoke，主线程用 queue.get(timeout) 强制硬超时。
 
     部分兼容端点对 HTTP 层 timeout 不生效（如推理型模型会长时间生成隐藏思维链），
@@ -211,7 +307,13 @@ def _invoke_hard_timeout(llm, prompt: str, timeout: float):
 
     def _worker():
         try:
-            q.put(("ok", llm.invoke(prompt)))
+            if raw_request is not None:
+                response = llm.client.create(
+                    messages=[{"role": "user", "content": prompt}], **raw_request
+                )
+            else:
+                response = llm.invoke(prompt)
+            q.put(("ok", response))
         except Exception as e:  # noqa: BLE001
             q.put(("err", e))
 
@@ -245,18 +347,50 @@ def _llm(prompt: str, model: Optional[str] = None, temperature: float = 0.7,
         timeout=effective_timeout,
         **extra,
     )
+    # LangChain currently discards StepFun's provider-specific reasoning fields
+    # while converting the raw response to AIMessage.
+    raw_request = None
+    if model_name.lower().startswith("step-"):
+        raw_request = {
+            "model": model_name,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
     last_err = None
     for attempt in range(1, max_retries + 1):
         call_start = time.perf_counter()
         try:
+            _REQUEST_RATE_LIMITER.acquire(_requests_per_minute(model_name))
             with _LLM_SEMAPHORE:
-                resp = _invoke_hard_timeout(llm, prompt, effective_timeout)
+                resp = _invoke_hard_timeout(
+                    llm, prompt, effective_timeout, raw_request=raw_request
+                )
             _track_usage(resp)
-            content = resp.content.strip()
+            content = _message_text(resp, "content")
             if content:
                 logger.info("LLM 调用完成 model=%s attempt=%d/%d elapsed=%.3fs",
                             model_name, attempt, max_retries, time.perf_counter() - call_start)
                 return content
+            reasoning = _reasoning_text(resp)
+            if reasoning:
+                logger.warning(
+                    "模型正文为空，使用二次收口整理提供商推理文本 model=%s reasoning_chars=%d",
+                    model_name, len(reasoning),
+                )
+                # StepFun may put the visible answer in reasoning_content while
+                # leaving content empty.  Passing that draft to later agents
+                # leaks meta-reasoning and often makes them return a critique
+                # instead of the requested artifact.  Always perform one
+                # provider-side finalization before exposing the text.
+                if model_name.lower().startswith("step-"):
+                    return _finalize_reasoning(
+                        llm, reasoning, model_name, effective_timeout,
+                        raw_request=raw_request,
+                    )
+                # Preserve compatibility for generic OpenAI-compatible
+                # adapters whose reasoning field is already their visible
+                # answer and are covered by the legacy contract.
+                return reasoning
             raise RuntimeError("模型返回空内容")
         except Exception as e:  # noqa: BLE001
             last_err = e
@@ -264,8 +398,10 @@ def _llm(prompt: str, model: Optional[str] = None, temperature: float = 0.7,
                            model_name, attempt, max_retries,
                            time.perf_counter() - call_start, e)
             if attempt < max_retries:
-                time.sleep(1.0 * attempt)
-    raise RuntimeError(f"LLM 调用失败（已重试 {max_retries} 次）：{last_err}")
+                base = (float(os.getenv("LLM_RETRY_BASE_SECONDS", "10"))
+                        if _is_rate_limit_error(e) else 1.0)
+                time.sleep(base * (2 ** (attempt - 1)))
+    raise RuntimeError(f"LLM 调用失败（共尝试 {max_retries} 次）：{last_err}")
 
 
 def _chat(prompt: str, model: Optional[str] = None, temperature: float = 0.7,
@@ -803,6 +939,8 @@ class DecentralizedCollaboration:
                 r = self._translate(task, ctx)
             elif tt in ("choice", "estimation"):
                 r = self._roundtable(task, ctx, is_numeric=(tt == "estimation"))
+            elif tt == "coding":
+                r = self._coding_roundtable(task, ctx, test_cases=test_cases)
             else:
                 r = self._refine(task, ctx)
             r.update(_finish(ctx, r["final_result"], r["mechanism"], r["confidence"],
@@ -810,6 +948,49 @@ class DecentralizedCollaboration:
             return r
 
         return _run_guarded(_go, "decentralized")
+
+    def _coding_roundtable(self, task: str, ctx: Channel,
+                           test_cases: Optional[List[dict]] = None) -> Dict[str, Any]:
+        """Peer code review that preserves the decentralized topology.
+
+        The old fallback sent coding tasks through ``_refine`` (a prose
+        writer/critic loop), so forced decentralized runs could never produce
+        executable code reliably.  Peers now draft independently, review the
+        candidates, and one peer emits a complete code artifact.
+        """
+        peers = make_agents(CRITIC_ROLES, min(max(self.n_agents, 2), 3),
+                            self.models, temperature=T_DRAFT)
+        prompts = [
+            f"{p.role}\n\n任务：{task}\n"
+            "请只输出完整、可运行的 Python 代码，不要输出评审过程。"
+            for p in peers
+        ]
+        drafts = _parallel_chat(prompts, models=[p.model for p in peers],
+                                temperatures=[T_DRAFT] * len(peers))
+        for p, draft in zip(peers, drafts):
+            ctx.post(p.name, draft, "proposal")
+        material = "\n\n".join(f"[候选{i + 1}] {x[:2200]}"
+                                for i, x in enumerate(drafts))
+        reviewer = peers[0]
+        prompt = (
+            "你是平级代码评审者。比较以下候选，只修复真实问题，保留正确实现。"
+            "最终只输出完整可运行的 Python 代码，不要解释、不要 Markdown 围栏。\n\n"
+            f"任务：{task}\n候选：\n{material}"
+        )
+        code = reviewer.chat(prompt, temperature=T_SYNTH)
+        ctx.post(reviewer.name, code, "synthesis")
+        code = _extract_python(code)
+        passed, total = _execute(code, test_cases) if test_cases else (0, 0)
+        confidence = passed / total if total else 0.7
+        if test_cases:
+            ctx.post("peer-runner", f"实测 {passed}/{total}", "verdict")
+        return {
+            "final_result": f"```python\n{code}\n```",
+            "mechanism": "decentralized.code_review",
+            "confidence": confidence,
+            "consensus_reached": confidence >= 0.5,
+            "agreement": confidence,
+        }
 
     def _roundtable(self, task: str, ctx: Channel, is_numeric: bool = False) -> Dict[str, Any]:
         """去中心化圆桌：peer 独立作答 → 互阅黑板 → 修正 → 聚合（无中心权威）。"""
@@ -880,7 +1061,8 @@ class DecentralizedCollaboration:
                 break
             fb = "\n".join(f"[{n}]: {r}" for n, r in feedback)
             # 只修复被指出的问题，保持其余内容不变（锚定，避免重写漂移）
-            draft = writer.chat(f"针对以下批评【只修复被指出的问题，保持其余内容不变】，输出完整成品：\n\n"
+            draft = writer.chat(f"针对以下批评【只修复被指出的问题，保持其余内容不变】，输出完整成品。"
+                                "禁止输出批评、修改说明或推理过程，只交付最终答案：\n\n"
                                 f"任务：{task}\n当前版本：\n{draft[:1200]}\n\n批评意见：\n{fb[:2000]}",
                                 temperature=T_SYNTH)
             ctx.post(writer.name, draft, "synthesis")

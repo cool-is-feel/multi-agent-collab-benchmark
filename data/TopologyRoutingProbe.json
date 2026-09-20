@@ -1,0 +1,122 @@
+[
+  {
+    "task_id": "route_c01",
+    "category": "math",
+    "difficulty": "easy",
+    "task_type": "computation",
+    "risk_level": "low",
+    "expected_topology": "centralized",
+    "task": "严格计算 18 + 24，给出唯一准确结果。",
+    "expected_output": "答案：42"
+  },
+  {
+    "task_id": "route_c02",
+    "category": "code",
+    "difficulty": "medium",
+    "task_type": "coding",
+    "risk_level": "low",
+    "expected_topology": "centralized",
+    "task": "实现 Python 函数 safe_divide(a, b)，b 为 0 时返回 None，并给出可运行代码。",
+    "expected_output": "代码必须定义 safe_divide(a, b)，正常返回 a / b，b == 0 时返回 None。"
+  },
+  {
+    "task_id": "route_c03",
+    "category": "fact_checking",
+    "difficulty": "medium",
+    "task_type": "analysis",
+    "risk_level": "medium",
+    "expected_topology": "centralized",
+    "task": "两个来源分别称某产品在 2022 年和 2023 年发布。判断事实状态，说明证据冲突和下一步核验来源。",
+    "expected_output": "应判断当前证据冲突、无法确定唯一发布日期，并建议查询权威一手来源。"
+  },
+  {
+    "task_id": "route_c04",
+    "category": "planning",
+    "difficulty": "hard",
+    "task_type": "analysis",
+    "risk_level": "high",
+    "expected_topology": "centralized",
+    "task": "制定生产数据库迁移执行方案，必须包含依赖盘点、分阶段步骤、回滚条件、负责人和量化验收指标。",
+    "expected_output": "方案需覆盖依赖盘点、分阶段迁移、明确回滚条件、责任人和量化验收指标。"
+  },
+  {
+    "task_id": "route_c05",
+    "category": "choice",
+    "difficulty": "easy",
+    "task_type": "choice",
+    "risk_level": "low",
+    "expected_topology": "centralized",
+    "task": "选择唯一正确答案：HTTP 状态码 404 表示什么？A 未授权；B 未找到；C 冲突；D 超时。",
+    "expected_output": "答案：B"
+  },
+  {
+    "task_id": "route_c06",
+    "category": "tool_use",
+    "difficulty": "medium",
+    "task_type": "analysis",
+    "risk_level": "medium",
+    "expected_topology": "centralized",
+    "task": "设计严格的 API 调用链：先获取 access token，再分页获取全部订单，失败最多重试两次，最后去重合并。",
+    "expected_output": "必须先获取 token，再分页请求订单；单页失败最多重试两次；最后按订单标识去重合并。"
+  },
+  {
+    "task_id": "route_d01",
+    "category": "creative_writing",
+    "difficulty": "easy",
+    "task_type": "creative",
+    "risk_level": "low",
+    "expected_topology": "decentralized",
+    "task": "为城市夜间阅读节创作三个风格明显不同的宣传口号，并说明各自适合的受众。",
+    "expected_output": "至少三个有明显风格差异的口号，并分别说明目标受众。"
+  },
+  {
+    "task_id": "route_d02",
+    "category": "debate",
+    "difficulty": "medium",
+    "task_type": "decision",
+    "risk_level": "low",
+    "expected_topology": "decentralized",
+    "task": "就远程办公是否应成为常态给出正反双方至少两条不同观点，回应主要反驳并形成有条件的结论。",
+    "expected_output": "正反双方各至少两条实质论据，回应主要反驳，并给出考虑岗位差异的条件性结论。"
+  },
+  {
+    "task_id": "route_d03",
+    "category": "translation",
+    "difficulty": "medium",
+    "task_type": "translation",
+    "risk_level": "low",
+    "expected_topology": "decentralized",
+    "task": "把 ‘Break the ice’ 翻译成适合中文团队培训海报的表达，并解释隐喻和本地化选择。",
+    "expected_output": "给出自然的中文本地化译文，并准确解释其打破陌生或尴尬局面的隐喻。"
+  },
+  {
+    "task_id": "route_d04",
+    "category": "decision",
+    "difficulty": "hard",
+    "task_type": "decision",
+    "risk_level": "medium",
+    "expected_topology": "decentralized",
+    "task": "围绕校园是否限制生成式 AI 使用，分别从学生、教师和管理者观点讨论收益、风险与权衡，给出政策建议。",
+    "expected_output": "覆盖学生、教师、管理者的不同观点，同时讨论收益与风险，并形成可执行且有边界的政策建议。"
+  },
+  {
+    "task_id": "route_d05",
+    "category": "creative_writing",
+    "difficulty": "hard",
+    "task_type": "creative",
+    "risk_level": "low",
+    "expected_topology": "decentralized",
+    "task": "为同一环保产品提出面向学生、家庭和企业采购者的三套创意文案，风格和说服重点必须不同。",
+    "expected_output": "分别面向学生、家庭、企业采购者给出三套文案，受众、风格和说服重点应明显不同。"
+  },
+  {
+    "task_id": "route_d06",
+    "category": "debate",
+    "difficulty": "hard",
+    "task_type": "decision",
+    "risk_level": "medium",
+    "expected_topology": "decentralized",
+    "task": "讨论公共场所人脸识别的伦理争议，呈现支持者与反对者的不同观点，识别共同底线并提出折中治理方案。",
+    "expected_output": "呈现安全便利与隐私歧视等正反观点，识别知情、必要性和问责等底线，并提出具体治理措施。"
+  }
+]
