@@ -762,6 +762,51 @@ class CollaborationControlLayer:
                       {"mode": mode, "changed": revised.strip() != answer.strip()})
         return revised
 
+    @staticmethod
+    def _failed_required_checks(report: VerificationReport) -> List[VerificationCheck]:
+        return [check for check in report.checks
+                if check.required and check.passed is not True]
+
+    def _should_try_alternate(self, request: TaskRequest, decision: TopologyDecision,
+                              answer: str, report: VerificationReport) -> bool:
+        """Require objective evidence before paying for a second topology.
+
+        Independent LLM review is useful but noisy.  A single subjective rejection
+        must not override a high-confidence routing decision.  Empty/error outputs,
+        deterministic checks, and genuinely uncertain routes are stronger signals.
+        """
+        override = request.metadata.get("topology_fallback")
+        if override is False:
+            return False
+        if override is True:
+            return True
+        if not answer.strip() or answer.startswith("ERROR:"):
+            return True
+        failed = self._failed_required_checks(report)
+        deterministic_failure = any(
+            check.mode in ("rule", "test", "evidence") for check in failed
+        )
+        return deterministic_failure or decision.needs_exploration
+
+    @staticmethod
+    def _fallback_call_reserve(profile: TaskProfile, budget: ResourceBudget,
+                               topology: str) -> int:
+        """Reserve a full alternate run plus its independent quality check."""
+        if topology == "centralized":
+            solver_calls = 3 + round(4 * profile.complexity)
+        else:
+            solver_calls = 5 + round(4 * profile.ambiguity)
+        return min(budget.max_calls, solver_calls) + 1
+
+    def _prefer_revision(self, original: VerificationReport,
+                         revised: VerificationReport) -> bool:
+        if revised.passed:
+            return True
+        if original.passed:
+            return False
+        return (len(self._failed_required_checks(revised))
+                < len(self._failed_required_checks(original)))
+
     def execute(self, value: Dict[str, Any] | TaskRequest) -> Dict[str, Any]:
         request = TaskRequest.from_value(value)
         governor = RuntimeGovernor(request.budget, self.communication_policy,
@@ -783,16 +828,23 @@ class CollaborationControlLayer:
             # adaptive request, test the other topology before spending the
             # remaining revision budget.  This reserves room for a genuinely
             # different solution instead of repeatedly polishing a failed one.
+            alternate = (
+                "decentralized" if decision.topology == "centralized" else "centralized"
+            )
+            fallback_calls = self._fallback_call_reserve(
+                profile, request.budget, alternate
+            )
             if (
                 not request.force_topology
                 and not report.passed
-                and governor.can_continue(calls_needed=3)
+                and self._should_try_alternate(request, decision, answer, report)
+                and governor.can_continue(calls_needed=fallback_calls)
             ):
-                alternate = "decentralized" if decision.topology == "centralized" else "centralized"
                 alternate_decision = self.select_topology(profile, request.budget, alternate)
                 governor.emit("topology.fallback", "control-layer", {
                     "from": decision.topology, "to": alternate,
-                    "reason": "primary candidate failed quality gate",
+                    "reason": "objective failure or uncertain routing decision",
+                    "reserved_calls": fallback_calls,
                 })
                 alternate_result = self._run_topology(request, alternate_decision)
                 alternate_answer = str(alternate_result.get("final_result", ""))
@@ -805,8 +857,14 @@ class CollaborationControlLayer:
                         alternate_result, alternate_answer, alternate_report
                     )
             if not report.passed and governor.can_continue(require_revision=True):
-                answer = self._revise(request, profile, answer, report, governor)
-                report = self._verify(request, profile, answer, result, governor, 2)
+                revised_answer = self._revise(
+                    request, profile, answer, report, governor
+                )
+                revised_report = self._verify(
+                    request, profile, revised_answer, result, governor, 2
+                )
+                if self._prefer_revision(report, revised_report):
+                    answer, report = revised_answer, revised_report
         except GovernanceLimit as exc:
             governor.stop_reason = governor.stop_reason or str(exc)
             if not answer:

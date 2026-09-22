@@ -209,11 +209,10 @@ class EndToEndControlTests(unittest.TestCase):
 
     def test_adaptive_falls_back_to_alternate_topology_after_failed_gate(self):
         layer = CollaborationControlLayer()
-        primary = {"final_result": "incomplete primary", "history": []}
+        primary = {"final_result": "", "history": []}
         alternate = {"final_result": "complete alternate", "history": []}
         failed = VerificationReport(False, "failed", [
-            VerificationCheck("independent_review", "independent_review",
-                              False, True, "missing requirements")
+            VerificationCheck("non_empty", "rule", False, True, "answer is empty")
         ], 1)
         passed = VerificationReport(True, "passed", [
             VerificationCheck("non_empty", "rule", True, True, "answer is present")
@@ -239,6 +238,58 @@ class EndToEndControlTests(unittest.TestCase):
         self.assertIn("topology.fallback", {
             event["event_type"] for event in result["audit_trail"]
         })
+
+    def test_high_confidence_subjective_rejection_does_not_switch_topology(self):
+        layer = CollaborationControlLayer()
+        primary = {"final_result": "42", "history": []}
+        rejected = VerificationReport(False, "failed", [
+            VerificationCheck("independent_review", "independent_review",
+                              False, True, "reviewer was unconvinced")
+        ], 1)
+        request = {
+            "task": "严格计算 18 + 24，给出唯一准确结果。",
+            "task_type": "computation",
+            "budget": {
+                "max_calls": 8, "max_steps": 32,
+                "max_input_tokens": 9000, "max_output_tokens": 9000,
+                "max_total_tokens": 9000, "max_revisions": 0,
+            },
+        }
+
+        with patch.object(layer, "_run_topology", return_value=primary) as run, \
+             patch.object(layer, "_verify", return_value=rejected):
+            result = layer.execute(request)
+
+        self.assertEqual(1, run.call_count)
+        self.assertEqual("42", result["final_result"])
+        self.assertNotIn("topology.fallback", {
+            event["event_type"] for event in result["audit_trail"]
+        })
+
+    def test_failed_revision_does_not_replace_original_candidate(self):
+        layer = CollaborationControlLayer()
+        primary = {"final_result": "complete original", "history": []}
+        failed = VerificationReport(False, "failed", [
+            VerificationCheck("independent_review", "independent_review",
+                              False, True, "one concern")
+        ], 1)
+        request = {
+            "task": "制定一份通用执行方案",
+            "task_type": "analysis",
+            "force_topology": "centralized",
+            "budget": {
+                "max_calls": 8, "max_steps": 32,
+                "max_input_tokens": 9000, "max_output_tokens": 9000,
+                "max_total_tokens": 9000, "max_revisions": 1,
+            },
+        }
+
+        with patch.object(layer, "_run_topology", return_value=primary), \
+             patch.object(layer, "_verify", side_effect=[failed, failed]), \
+             patch.object(layer, "_revise", return_value="worse revision"):
+            result = layer.execute(request)
+
+        self.assertEqual("complete original", result["final_result"])
 
 
 if __name__ == "__main__":
